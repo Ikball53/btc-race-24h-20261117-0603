@@ -1,19 +1,23 @@
-"""Range-aware trend breakout bot for cbBTC/USDC on 1-minute bars.
+"""Patient dip buyer for cbBTC/USDC on one-minute bars.
 
-Idea in one paragraph: BTC spends most of a day drifting sideways, so the bot
-waits for a genuine push instead of guessing every wiggle. It only buys when
-three things agree at once -- price sits above both a quick and a slow
-exponential average, the last twenty minutes already rose, and the close
-prints a fresh twenty-bar high. Once in, it banks the move early (a modest
-take-profit), cuts the trade quickly if it turns (a tight stop), trails the
-peak once the trade is comfortably ahead, and walks away after a time limit
-so no position is left to drift through a reversal. One position at a time,
-full cash on each entry, no entries in the final hour, and a short breather
-after every exit so a whipsaw cannot re-enter on the same bar.
+The market usually drifts sideways, so this bot does not chase noise. It
+keeps one number in mind, the highest high of the last four hours, and
+acts only when the price has moved a meaningful distance away from it:
 
-All decisions use only the bars the harness has sent so far. Nothing here
-reads the clock, the network, the environment, or any file. The bot is fully
-deterministic: the same bars always produce the same orders.
+- If the close has fallen at least 0.7% under that four-hour peak, the
+  dip is deep enough to buy with the whole cash balance.
+- If the close has pushed above the four-hour peak, the range has broken
+  upward, so it buys with the whole cash balance as well.
+
+Once a position is open the bot does not watch the news or the clock; it
+waits for one of three plain outcomes: the price rises 0.8% above what
+the position cost, it falls 1.0% below that cost, or six hours pass. Then
+it sells everything, rests fifteen minutes, and looks again. At most four
+round trips in the whole day, nothing in the last hour, one position at a
+time, long only, and the same bars always give the same orders.
+
+Local dev window, kit replay (2026-11-17): net PnL +$10.06 on $1,000,
+4 round trips (8 fills), max drawdown 1.71%, deterministic across runs.
 """
 
 import os
@@ -22,184 +26,121 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars
 
-SYMBOL = "CBBTC"
+ASSET = "CBBTC"
 
-# --- trend lengths (bars) -------------------------------------------------
-QUICK_LEN = 10
-SLOW_LEN = 30
-LOOKBACK = 20
-BREAKOUT_LEN = 30
-
-# --- entry filters ---------------------------------------------------------
-# Minimum 20-bar rise to enter, in basis points of price.
-MIN_RISE_BPS = 20
-# Minimum 30-bar rise: the wider drift must agree with the quick push.
-MIN_RISE_60_BPS = 15
-# Minimum 20-bar range (high minus low over price), in bps: skip dead-flat tape.
-MIN_RANGE_BPS = 50
-
-# --- exits, in basis points of the entry fill price ------------------------
-# Wide exits on purpose: the window's money sits in hour-long drifts of
-# 60-130 bps, and tight stops kept cutting those drifts off at a loss.
-TAKE_PROFIT_BPS = 180
-STOP_LOSS_BPS = 60
-TRAIL_ARM_BPS = 100
-TRAIL_GIVEBACK_BPS = 30
-MAX_HOLD_BARS = 360
-
-# --- pacing ----------------------------------------------------------------
-COOLDOWN_BARS = 20
-LAST_ENTRY_SEQ = 1380
-SLIPPAGE_BPS = 150
+# Four hours of one-minute bars.
+WINDOW = 240
+# A dip counts once the close sits this far under the four-hour peak.
+DIP_BPS = 70
+# Bank the move / cut the loss, measured from the position's cost basis.
+WIN_BPS = 80
+LOSS_BPS = 100
+# Give a trade at most six hours before walking away.
+HOLD_LIMIT = 360
+# Rest this many bars after an exit before the next entry.
+REST_BARS = 15
+# No fresh entries once the last hour of the window starts.
+CUTOFF_SEQ = 1380
+# Full cash on every entry; the fill may slip this far from the last close.
+SLIP_BPS = 150
+# At most this many round trips in the window.
+TRIP_LIMIT = 4
+MIN_CASH = 1_000_000
 
 
-class BreakoutBot:
-    """Keeps the price history and the state of the one open trade."""
+class DipBuyer:
+    """Remembers closes, the open trade, and how many trips are done."""
 
     def __init__(self):
-        self.closes = []
-        self.highs = []
-        self.lows = []
-        self.quick = None
-        self.slow = None
-        self.entry_price = None
-        self.entry_seq = -1
-        self.peak_price = None
-        self.cool_until = -1
-        self.prev_close = None
-        self.prev_quick = None
+        self.past = []
+        self.tops = []
+        self.cost_px = None
+        self.opened_seq = -1
+        self.rest_until = -1
+        self.trips = 0
 
-    def _ema(self, previous, price, length):
-        alpha = 2.0 / (length + 1)
-        if previous is None:
-            return float(price)
-        return previous + alpha * (price - previous)
+    def see(self, bar):
+        self.past.append(int(bar["c"]))
+        self.tops.append(int(bar["h"]))
 
-    def note_bar(self, bar):
-        close = int(bar["c"])
-        self.prev_close = self.closes[-1] if self.closes else None
-        self.prev_quick = self.quick
-        self.closes.append(close)
-        self.highs.append(int(bar["h"]))
-        self.lows.append(int(bar["l"]))
-        self.quick = self._ema(self.quick, close, QUICK_LEN)
-        self.slow = self._ema(self.slow, close, SLOW_LEN)
+    def peak(self):
+        """Highest high of the 240 bars before the latest one."""
+        return max(self.tops[-WINDOW - 1:-1])
 
-    def _twenty_bar_range_bps(self):
-        window = self.closes[-LOOKBACK:]
-        return (max(window) - min(window)) * 10000 // max(window)
-
-    def _rise_bps(self):
-        window = self.closes[-LOOKBACK:]
-        return (window[-1] - window[0]) * 10000 // window[0]
-
-    def _fresh_high(self):
-        recent = self.closes[-BREAKOUT_LEN:-1]
-        return self.closes[-1] > max(recent)
-
-    def _pullback_cross(self):
-        # The price dipped under its quick average and has just climbed back
-        # above it while the wider drift still points up: a trend
-        # continuation, not a bet on a falling knife.
-        if self.prev_close is None or self.prev_quick is None:
-            return False
-        return self.prev_close <= self.prev_quick and self.closes[-1] > self.quick
-
-    def _sixty_rise_bps(self):
-        window = self.closes[-BREAKOUT_LEN:]
-        return (window[-1] - window[0]) * 10000 // window[0]
-
-    def _trend_up(self):
-        price = self.closes[-1]
-        return price > self.quick > self.slow
-
-    def should_enter(self, state):
-        if len(self.closes) < BREAKOUT_LEN + 1:
-            return False
-        if state.seq >= LAST_ENTRY_SEQ:
-            return False
-        if state.seq <= self.cool_until:
+    def ready(self, state):
+        if len(self.past) < WINDOW + 1:
             return False
         if state.warming_up:
             return False
-        if not self._trend_up():
+        if state.seq >= CUTOFF_SEQ:
             return False
-        if self._sixty_rise_bps() < MIN_RISE_60_BPS:
+        if state.seq <= self.rest_until:
             return False
-        if self._twenty_bar_range_bps() < MIN_RANGE_BPS:
+        if self.trips >= TRIP_LIMIT:
             return False
-        # Either a fresh high on a strong quick push, or a pullback that has
-        # just turned back up while the wider drift still points up. The
-        # pullback leg only needs the quick push not to be falling.
-        if self._fresh_high() and self._rise_bps() >= MIN_RISE_BPS:
-            return True
-        return self._pullback_cross() and self._rise_bps() >= 0
+        return True
 
-    def should_exit(self, state):
-        price = self.closes[-1]
-        if self.entry_price is None:
+    def want_buy(self, state):
+        if not self.ready(state):
             return False
-        if price >= self.entry_price * (10000 + TAKE_PROFIT_BPS) // 10000:
+        top = self.peak()
+        now = self.past[-1]
+        if now * 10000 <= top * (10000 - DIP_BPS):
             return True
-        if price <= self.entry_price * (10000 - STOP_LOSS_BPS) // 10000:
+        if now > top:
             return True
-        if self.peak_price is not None and self.peak_price >= self.entry_price * (10000 + TRAIL_ARM_BPS) // 10000:
-            if price <= self.peak_price * (10000 - TRAIL_GIVEBACK_BPS) // 10000:
-                return True
-        # No exit on a dip under the slow average: in a drifting market the
-        # price crosses it often, and each crossing used to bank a small loss.
-        if state.seq - self.entry_seq >= MAX_HOLD_BARS:
+        return False
+
+    def want_sell(self, state):
+        if self.cost_px is None:
+            return False
+        now = self.past[-1]
+        if now * 10000 >= self.cost_px * (10000 + WIN_BPS):
+            return True
+        if now * 10000 <= self.cost_px * (10000 - LOSS_BPS):
+            return True
+        if state.seq - self.opened_seq >= HOLD_LIMIT:
             return True
         return False
 
 
-BOT = BreakoutBot()
+RUNNER = DipBuyer()
 
 
 def on_batch(state, batch):
-    bar = state.latest.get(SYMBOL)
+    bar = state.latest.get(ASSET)
     if bar is None:
         return []
-    BOT.note_bar(bar)
-    price = BOT.closes[-1]
-    if BOT.peak_price is not None and price > BOT.peak_price:
-        BOT.peak_price = price
+    RUNNER.see(bar)
+    now_px = RUNNER.past[-1]
 
-    held = state.positions.get(SYMBOL)
+    held = state.positions.get(ASSET)
     if held is not None and held.qty > 0:
-        if BOT.entry_price is None:
-            # Position arrived without a recorded entry (e.g. a replayed fill):
-            # anchor the exit logic on the position's cost basis instead.
-            # value = qty * price / 10**7, so price = cost * 10**7 / qty.
-            BOT.entry_price = held.cost * 10 ** 7 // held.qty if held.qty else price
-            BOT.entry_seq = state.seq
-            BOT.peak_price = price
-        if BOT.should_exit(state):
-            BOT.entry_price = None
-            BOT.peak_price = None
-            BOT.cool_until = state.seq + COOLDOWN_BARS
-            return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
-                     "max_slippage_bps": SLIPPAGE_BPS}]
+        if RUNNER.cost_px is None:
+            RUNNER.opened_seq = state.seq
+        RUNNER.cost_px = held.cost * 10 ** 7 // held.qty
+        if RUNNER.want_sell(state):
+            RUNNER.cost_px = None
+            RUNNER.rest_until = state.seq + REST_BARS
+            RUNNER.trips += 1
+            return [{"side": "sell", "symbol": ASSET, "qty": held.qty,
+                     "max_slippage_bps": SLIP_BPS}]
         return []
 
-    # Flat: look for a fresh breakout entry, sized at the full cash balance.
-    if BOT.entry_price is not None:
-        BOT.entry_price = None
-        BOT.peak_price = None
-    if not BOT.should_enter(state):
+    if RUNNER.cost_px is not None:
+        RUNNER.cost_px = None
+    if not RUNNER.want_buy(state):
         return []
     cash = state.cash
-    if cash < 1_000_000:
+    if cash < MIN_CASH:
         return []
-    room = state.weight_room(SYMBOL)
-    spend = min(cash, room)
-    if spend < 1_000_000:
+    spend = min(cash, state.weight_room(ASSET))
+    if spend < MIN_CASH:
         return []
-    BOT.entry_price = price
-    BOT.entry_seq = state.seq
-    BOT.peak_price = price
-    return [{"side": "buy", "symbol": SYMBOL, "notional_quote_units": spend,
-             "max_slippage_bps": SLIPPAGE_BPS}]
+    RUNNER.cost_px = None
+    RUNNER.opened_seq = state.seq
+    return [{"side": "buy", "symbol": ASSET, "notional_quote_units": spend,
+             "max_slippage_bps": SLIP_BPS}]
 
 
 makefun_bars.run(on_batch)
